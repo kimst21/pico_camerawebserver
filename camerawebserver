@@ -1,0 +1,170 @@
+#include "esp_camera.h"     // ESP32-CAM 카메라 드라이버
+#include <WiFi.h>           // Wi-Fi 연결용
+#include <WiFiUdp.h>        // UDP 통신용 (좌표 수신)
+
+// 카메라 보드 모델 정의 (AI Thinker ESP32-CAM 기준)
+// 다른 모델 사용 시 이 정의를 변경
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"    // 모델별 카메라 핀 정의 (자동으로 처리됨)
+
+// Wi-Fi 인증 정보
+// 본인의 Wi-Fi SSID와 비밀번호로 변경
+const char *ssid = "YOUR_WIFI_SSID";
+const char *password = "YOUR_WIFI_PASSWORD";
+
+// UDP 통신 설정
+const int UDP_PORT = 4210;       // 좌표 수신 포트 (PC와 일치해야 함)
+WiFiUDP udp;                     // UDP 통신 객체
+char packetBuffer[64];           // 수신 패킷 저장 버퍼 (최대 64바이트)
+
+// UART 통신 설정 (Pico와의 시리얼 연결)
+// HardwareSerial 객체 (UART2 사용)
+// ESP32에는 UART0(시리얼 모니터), UART1(부트로더), UART2(사용자용)가 있음
+// UART2를 Pico와의 통신에 사용
+HardwareSerial picoSerial(2);
+
+// CameraWebServer 예제에서 제공하는 함수
+// 카메라 영상 스트리밍 HTTP 서버를 시작 (포트 80, 81)
+void startCameraServer();
+
+// setup(): 부팅 시 한 번 실행
+void setup() {
+  Serial.begin(115200);              // 시리얼 모니터용 초기화 (디버깅 출력)
+  Serial.setDebugOutput(true);
+  Serial.println();
+
+  // 카메라 설정
+  // OV2640 센서 핀 매핑과 영상 포맷 설정
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  
+  // 카메라 데이터 핀 (Y2~Y9: 8비트 픽셀 데이터)
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  
+  // 카메라 동기화 클럭 핀
+  config.pin_xclk = XCLK_GPIO_NUM;       // 외부 클럭
+  config.pin_pclk = PCLK_GPIO_NUM;       // 픽셀 클럭
+  config.pin_vsync = VSYNC_GPIO_NUM;     // 수직 동기
+  config.pin_href = HREF_GPIO_NUM;       // 수평 동기
+  
+  // I2C(SCCB) 통신 핀 (카메라 설정 제어용)
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  
+  // 전원 제어 핀
+  config.pin_pwdn = PWDN_GPIO_NUM;       // 카메라 전원 다운 핀
+  config.pin_reset = RESET_GPIO_NUM;     // 리셋 핀
+  
+  // 카메라 동작 파라미터
+  config.xclk_freq_hz = 20000000;            // 외부 클럭 20MHz
+  config.frame_size = FRAMESIZE_UXGA;        // 초기 해상도 (이후 QVGA로 변경됨)
+  config.pixel_format = PIXFORMAT_JPEG;      // MJPEG 포맷 (스트리밍용)
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY; // 버퍼가 빌 때 캡처
+  config.fb_location = CAMERA_FB_IN_PSRAM;   // 프레임 버퍼를 PSRAM에 (큰 영상용)
+  config.jpeg_quality = 12;                  // JPEG 품질 (10~63, 낮을수록 고품질)
+  config.fb_count = 1;                       // 기본 버퍼 1개
+
+  // PSRAM 유무에 따른 추가 설정
+  // PSRAM이 있으면 더 높은 품질 + 더블 버퍼링
+  if(config.pixel_format == PIXFORMAT_JPEG){
+    if(psramFound()){
+      config.jpeg_quality = 10;              // 고품질
+      config.fb_count = 2;                   // 더블 버퍼링 (영상 처리와 전송 동시)
+      config.grab_mode = CAMERA_GRAB_LATEST; // 최신 프레임 우선
+    } else {
+      config.frame_size = FRAMESIZE_SVGA;    // PSRAM 없으면 해상도 낮춤
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+  } else {
+    config.frame_size = FRAMESIZE_240X240;
+  }
+
+  // 카메라 초기화
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;   // 초기화 실패 시 setup 종료
+  }
+
+  // 센서별 추가 설정
+  sensor_t * s = esp_camera_sensor_get();
+  
+  // OV3660 센서는 영상이 뒤집혀 나오므로 보정
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
+  }
+  
+  // 운영 해상도를 QVGA(320x240)로 설정
+  // 시작 시 UXGA로 설정했지만, fps 향상을 위해 QVGA로 낮춤
+  // QVGA에서 약 6fps, MediaPipe 손 검출에 충분한 해상도
+  if(config.pixel_format == PIXFORMAT_JPEG){
+    s->set_framesize(s, FRAMESIZE_QVGA);
+  }
+
+  // Wi-Fi 연결
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);    // 슬립 비활성화 (영상 스트리밍 안정성 향상)
+
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");     // 연결 대기 중 점 출력
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+
+  // HTTP 영상 스트리밍 서버 시작
+  // 포트 80: 카메라 설정 페이지
+  // 포트 81: 영상 스트림 (/stream 경로)
+  startCameraServer();
+
+  Serial.print("Camera Ready! Use 'http://");
+  Serial.print(WiFi.localIP());          // 할당받은 IP 출력 (PC가 이 IP로 접속)
+  Serial.println("' to connect");
+
+  // UDP 수신 시작 (PC로부터 좌표 받기)
+  udp.begin(UDP_PORT);
+  Serial.printf("UDP listening on port %d\n", UDP_PORT);
+  
+  // UART2 시작 (Pico와 통신)
+  // RX = GPIO 15, TX = GPIO 14
+  // ESP32-CAM에서 카메라가 안 쓰는 핀 중 GPIO 14, 15가 가장 무난
+  picoSerial.begin(115200, SERIAL_8N1, 15, 14);
+  Serial.println("UART to Pico ready");
+}
+
+// loop(): 무한 반복 실행
+// 단순 중계만 수행 - UDP 수신 → 시리얼 출력 + UART 송신
+void loop() {
+  // UDP 패킷이 도착했는지 확인 (논블로킹)
+  int packetSize = udp.parsePacket();
+  
+  if (packetSize) {
+    // 패킷을 버퍼로 읽기
+    int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+    if (len > 0) packetBuffer[len] = '\0';   // 문자열 종료자 추가
+    
+    // 시리얼 모니터에 받은 패킷 출력 (디버깅용)
+    Serial.print("[RX] ");
+    Serial.println(packetBuffer);
+    
+    // 받은 좌표를 그대로 UART로 Pico에 전달
+    // ESP32는 좌표를 가공하지 않고 단순 중계만 수행 (역할 분담)
+    picoSerial.print(packetBuffer);
+    picoSerial.println();    
+  }
+  
+    // 1ms 대기 
+  // 카메라 서버는 별도 태스크로 동작하므로 이 대기가 영상에 영향 없음
+delay(1);
+}
